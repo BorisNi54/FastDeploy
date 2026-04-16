@@ -55,6 +55,14 @@ func main() {
 
 	intervalSecs := cfg.Manager.HealthCheckIntervalSecs
 	go manager.MonitorInstanceHealth(context.Background(), intervalSecs)
+	if cfg.Manager.EnableInferReadyCheck {
+		go manager.CheckInferenceReady(context.Background(), cfg.Manager.InferReadyCheckIntervalSecs)
+	}
+	metricsUpdateIntervalSecs := cfg.Manager.MetricsUpdateIntervalSecs
+	go manager.MonitorWorkerMetrics(context.Background(), metricsUpdateIntervalSecs)
+	queueCheckIntervalSecs := cfg.Manager.QueueCheckIntervalSecs
+	queueThreshold := cfg.Manager.QueueThreshold
+	go manager.MonitorQueueStatus(context.Background(), queueCheckIntervalSecs, queueThreshold)
 	intervalCleanupSecs := cfg.Scheduler.EvictionIntervalSecs
 	go scheduler_handler.StartBackupCleanupTask(context.Background(), intervalCleanupSecs)
 	statsIntervalSecs := cfg.Scheduler.StatsIntervalSecs

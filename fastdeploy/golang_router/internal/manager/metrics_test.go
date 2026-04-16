@@ -33,10 +33,11 @@ func TestRedrictCounter(t *testing.T) {
 	// Initialize scheduler for counter tests
 	cfg := &config.Config{
 		Scheduler: config.SchedulerConfig{
-			Policy:        "random",
-			PrefillPolicy: "random",
-			DecodePolicy:  "random",
-			WaitingWeight: 1.0,
+			Policy:               "random",
+			PrefillPolicy:        "random",
+			DecodePolicy:         "random",
+			WaitingWeight:        1.0,
+			EvictionDurationMins: 30, // Required to avoid panic in NewTicker
 		},
 	}
 	// Using nil for managerAPI since we're only testing counters
@@ -105,13 +106,14 @@ func TestRedrictCounter(t *testing.T) {
 	})
 }
 
-func TestParseMetricsResponseOptimized(t *testing.T) {
+func TestParseMetricsResponse(t *testing.T) {
 	tests := []struct {
 		name         string
 		input        string
-		expectedRun  float64
-		expectedWait float64
-		expectedGpu  float64
+		expectedRun  int
+		expectedWait int
+		expectedGpu  int
+		expectErr    bool
 	}{
 		{
 			name: "valid metrics response",
@@ -121,27 +123,35 @@ available_gpu_block_num 3`,
 			expectedRun:  10,
 			expectedWait: 5,
 			expectedGpu:  3,
+			expectErr:    false,
 		},
 		{
 			name: "partial metrics response",
 			input: `fastdeploy:num_requests_running 8
 available_gpu_block_num 2`,
-			expectedRun:  8,
-			expectedWait: -1,
-			expectedGpu:  2,
+			expectedRun:  0,
+			expectedWait: 0,
+			expectedGpu:  0,
+			expectErr:    true, // missing waiting field causes error
 		},
 		{
 			name:         "empty response",
 			input:        "",
-			expectedRun:  -1,
-			expectedWait: -1,
-			expectedGpu:  -1,
+			expectedRun:  0,
+			expectedWait: 0,
+			expectedGpu:  0,
+			expectErr:    true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			run, wait, gpu := parseMetricsResponseOptimized(tt.input)
+			run, wait, gpu, err := parseMetricsResponse(tt.input)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 			assert.Equal(t, tt.expectedRun, run)
 			assert.Equal(t, tt.expectedWait, wait)
 			assert.Equal(t, tt.expectedGpu, gpu)
@@ -149,7 +159,7 @@ available_gpu_block_num 2`,
 	}
 }
 
-func TestGetMetricsByURL_Integration(t *testing.T) {
+func TestFetchMetricsByURL_Integration(t *testing.T) {
 	// Initialize manager for testing
 	Init(&config.Config{})
 
@@ -183,7 +193,7 @@ available_gpu_block_num 8`))
 
 	// Test worker not found
 	t.Run("worker_not_found", func(t *testing.T) {
-		_, _, _, err := GetMetricsByURL(context.Background(), "http://nonexistent-worker:8080")
+		_, err := fetchMetricsByURL(context.Background(), "http://nonexistent-worker:8080")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "worker info not found")
 	})
@@ -209,19 +219,19 @@ available_gpu_block_num 8`))
 		t.Logf("Looking up worker for URL: %s", workerURL)
 
 		// Test valid metrics response - the test server should handle scenarios based on the request
-		running, waiting, gpu, err := GetMetricsByURL(context.Background(), workerURL)
+		metrics, err := fetchMetricsByURL(context.Background(), workerURL)
 		if err != nil {
 			t.Logf("Error: %v", err)
 		}
 		assert.NoError(t, err)
-		assert.Equal(t, 1, running) // Default scenario in test server
-		assert.Equal(t, 0, waiting) // Default scenario in test server
-		assert.Equal(t, 8, gpu)     // Default scenario in test server
+		assert.Equal(t, 1, metrics.NumRequestsRunning)   // Default scenario in test server
+		assert.Equal(t, 0, metrics.NumRequestsWaiting)   // Default scenario in test server
+		assert.Equal(t, 8, metrics.AvailableGpuBlockNum) // Default scenario in test server
 	})
 
 	// Test invalid URL
 	t.Run("invalid_url", func(t *testing.T) {
-		_, _, _, err := GetMetricsByURL(context.Background(), "http://invalid url")
+		_, err := fetchMetricsByURL(context.Background(), "http://invalid url")
 		assert.Error(t, err)
 	})
 	// Test partial metrics
@@ -238,14 +248,14 @@ available_gpu_block_num 8`))
 
 		t.Logf("Looking up worker for URL: %s", workerURL)
 
-		running, waiting, gpu, err := GetMetricsByURL(context.Background(), workerURL)
+		metrics, err := fetchMetricsByURL(context.Background(), workerURL)
 		if err != nil {
 			t.Logf("Error: %v", err)
 		}
 		assert.NoError(t, err)
-		assert.Equal(t, 1, running) // Default scenario
-		assert.Equal(t, 0, waiting) // Default scenario
-		assert.Equal(t, 8, gpu)     // Default scenario
+		assert.Equal(t, 1, metrics.NumRequestsRunning)   // Default scenario
+		assert.Equal(t, 0, metrics.NumRequestsWaiting)   // Default scenario
+		assert.Equal(t, 8, metrics.AvailableGpuBlockNum) // Default scenario
 	})
 }
 
@@ -255,15 +265,14 @@ func TestManagerGetMetrics_Integration(t *testing.T) {
 	// Initialize scheduler for counter tests
 	cfg := &config.Config{
 		Scheduler: config.SchedulerConfig{
-			Policy:        "random",
-			PrefillPolicy: "random",
-			DecodePolicy:  "random",
-			WaitingWeight: 1.0,
+			Policy:               "random",
+			PrefillPolicy:        "random",
+			DecodePolicy:         "random",
+			WaitingWeight:        1.0,
+			EvictionDurationMins: 30, // Required to avoid panic in NewTicker
 		},
 	}
 	scheduler_handler.Init(cfg, nil)
-
-	m := &Manager{}
 
 	// Setup mock HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -289,24 +298,26 @@ available_gpu_block_num 5`))
 		t.Logf("Registered worker with MetricsPort: %s", strconv.Itoa(server.Listener.Addr().(*net.TCPAddr).Port))
 		DefaultManager.mu.Unlock()
 
-		// Debug: test GetMetricsByURL directly first
-		t.Logf("Testing GetMetricsByURL directly...")
-		running, waiting, gpu, err := GetMetricsByURL(context.Background(), workerURL)
+		// Debug: test fetchMetricsByURL directly first
+		t.Logf("Testing fetchMetricsByURL directly...")
+		metrics, err := fetchMetricsByURL(context.Background(), workerURL)
 		if err != nil {
-			t.Logf("GetMetricsByURL failed: %v", err)
+			t.Logf("fetchMetricsByURL failed: %v", err)
 		} else {
-			t.Logf("GetMetricsByURL succeeded: running=%d, waiting=%d, gpu=%d", running, waiting, gpu)
+			t.Logf("fetchMetricsByURL succeeded: running=%d, waiting=%d, gpu=%d",
+				metrics.NumRequestsRunning, metrics.NumRequestsWaiting, metrics.AvailableGpuBlockNum)
 		}
 
 		// Test Manager.GetRemoteMetrics (uses real remote metrics)
-		running, waiting, gpu = m.GetRemoteMetrics(context.Background(), workerURL)
+		// Use DefaultManager which is properly initialized
+		running, waiting, gpu := DefaultManager.GetRemoteMetrics(context.Background(), workerURL)
 		t.Logf("Manager.GetRemoteMetrics result: running=%d, waiting=%d, gpu=%d", running, waiting, gpu)
 		assert.Equal(t, 2, running)
 		assert.Equal(t, 1, waiting)
 		assert.Equal(t, 5, gpu)
 
 		// Test Manager.GetMetrics (uses in-memory counting)
-		runningMem, waitingMem, gpuMem := m.GetMetrics(context.Background(), workerURL)
+		runningMem, waitingMem, gpuMem := DefaultManager.GetMetrics(context.Background(), workerURL)
 		t.Logf("Manager.GetMetrics result: running=%d, waiting=%d, gpu=%d", runningMem, waitingMem, gpuMem)
 		assert.Equal(t, 0, runningMem) // in-memory counter, should be 0
 		assert.Equal(t, 0, waitingMem)
@@ -317,7 +328,7 @@ available_gpu_block_num 5`))
 	t.Run("error_fallback", func(t *testing.T) {
 		// Use a URL that doesn't have a registered worker
 		workerURL := "http://unknown-worker:8080"
-		running, waiting, gpu := m.GetMetrics(context.Background(), workerURL)
+		running, waiting, gpu := DefaultManager.GetMetrics(context.Background(), workerURL)
 
 		// Should fall back to counter (which should be 0 for new URL)
 		assert.Equal(t, 0, running) // Should be 0 for new counter
@@ -332,33 +343,42 @@ func TestMetricsParsingHelper(t *testing.T) {
 		name        string
 		metricsBody string
 		expected    []int
+		expectErr   bool
 	}{
 		{
 			name: "complete_metrics",
 			metricsBody: `fastdeploy:num_requests_running 5
 fastdeploy:num_requests_waiting 3
 available_gpu_block_num 10`,
-			expected: []int{5, 3, 10},
+			expected:  []int{5, 3, 10},
+			expectErr: false,
 		},
 		{
 			name: "missing_waiting",
 			metricsBody: `fastdeploy:num_requests_running 2
 available_gpu_block_num 5`,
-			expected: []int{2, -1, 5},
+			expected:  []int{0, 0, 0},
+			expectErr: true, // missing waiting field causes error
 		},
 		{
 			name:        "empty_body",
 			metricsBody: "",
-			expected:    []int{-1, -1, -1},
+			expected:    []int{0, 0, 0},
+			expectErr:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			run, wait, gpu := parseMetricsResponseOptimized(tt.metricsBody)
-			assert.Equal(t, float64(tt.expected[0]), run)
-			assert.Equal(t, float64(tt.expected[1]), wait)
-			assert.Equal(t, float64(tt.expected[2]), gpu)
+			run, wait, gpu, err := parseMetricsResponse(tt.metricsBody)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.expected[0], run)
+			assert.Equal(t, tt.expected[1], wait)
+			assert.Equal(t, tt.expected[2], gpu)
 		})
 	}
 }

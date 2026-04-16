@@ -6,6 +6,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -336,14 +337,14 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 	c.Request = c.Request.WithContext(ctx)
 
 	var (
-		destURL           string
-		releaseTargets    []string
-		requestBodyData   []byte
-		prefillURL        string
-		decodeURL         string
-		message           string
-		requestID         string
-		prefillHandedOff  bool // true once readPrefillRecv goroutine takes ownership of prefill counters
+		destURL          string
+		releaseTargets   []string
+		requestBodyData  []byte
+		prefillURL       string
+		decodeURL        string
+		message          string
+		requestID        string
+		prefillHandedOff bool // true once readPrefillRecv goroutine takes ownership of prefill counters
 	)
 
 	if isSplitwise {
@@ -355,13 +356,40 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 		message = extractor(rawReq)
 
 		logger.Info(ctx, "Parsing completed; starting worker selection.")
-		prefillURL, decodeURL, err = manager.SelectWorkerPair(ctx, message)
-		if err != nil {
-			logger.Error(ctx, "Failed to select worker pair: %v", err)
-			c.Writer.WriteHeader(http.StatusBadGateway)
-			c.Writer.Write([]byte(fmt.Sprintf(`{"error": "Failed to select worker pair: %v", "request_id": "%s"}`, err, requestID)))
-			return
+		manager.IncrementPendingRequest()
+		for {
+			prefillURL, decodeURL, err = manager.SelectWorkerPair(ctx, message)
+			if err != nil {
+				if errors.Is(err, scheduler_handler.ErrNoHealthyWorkers) {
+					// No healthy workers available, return 503 immediately
+					manager.DecrementPendingRequest()
+					logger.Error(ctx, "No healthy workers available: %v", err)
+					c.Writer.WriteHeader(http.StatusServiceUnavailable)
+					c.Writer.Write([]byte(fmt.Sprintf(`{"error": "no healthy workers available", "request_id": "%s"}`, requestID)))
+					return
+				}
+				if errors.Is(err, scheduler_handler.ErrAllWorkersAtCapacity) {
+					// All workers at capacity, wait and retry
+					select {
+					case <-ctx.Done():
+						manager.DecrementPendingRequest()
+						logger.Error(ctx, "Context canceled while waiting for available worker: %v", ctx.Err())
+						c.Writer.WriteHeader(http.StatusTooManyRequests)
+						c.Writer.Write([]byte(fmt.Sprintf(`{"error": "all workers have reached capacity limit", "request_id": "%s"}`, requestID)))
+						return
+					case <-time.After(5 * time.Millisecond):
+						continue
+					}
+				}
+				manager.DecrementPendingRequest()
+				logger.Error(ctx, "Failed to select worker pair: %v", err)
+				c.Writer.WriteHeader(http.StatusBadGateway)
+				c.Writer.Write([]byte(fmt.Sprintf(`{"error": "Failed to select worker pair: %v", "request_id": "%s"}`, err, requestID)))
+				return
+			}
+			break
 		}
+		manager.DecrementPendingRequest()
 		if prefillURL == "" || decodeURL == "" {
 			c.Writer.WriteHeader(http.StatusServiceUnavailable)
 			c.Writer.Write([]byte(fmt.Sprintf(`{"error": "No available prefill/decode workers", "request_id": "%s"}`, requestID)))
@@ -413,13 +441,41 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 		logger.Info(ctx, "Parsing completed; starting worker selection.")
 		// Non-PD mode: use Mixed instance
 		message = extractor(rawReq)
-		dest, err := manager.SelectWorker(ctx, message)
-		if err != nil {
-			logger.Error(ctx, "Failed to select worker: %v", err)
-			c.Writer.WriteHeader(http.StatusBadGateway)
-			c.Writer.Write([]byte(fmt.Sprintf(`{"error": "Failed to select worker: %v"}`, err)))
-			return
+		var dest string
+		manager.IncrementPendingRequest()
+		for {
+			dest, err = manager.SelectWorker(ctx, message)
+			if err != nil {
+				if errors.Is(err, scheduler_handler.ErrNoHealthyWorkers) {
+					// No healthy workers available, return 503 immediately
+					manager.DecrementPendingRequest()
+					logger.Error(ctx, "No healthy workers available: %v", err)
+					c.Writer.WriteHeader(http.StatusServiceUnavailable)
+					c.Writer.Write([]byte(`{"error": "no healthy workers available"}`))
+					return
+				}
+				if errors.Is(err, scheduler_handler.ErrAllWorkersAtCapacity) {
+					// All workers at capacity, wait and retry
+					select {
+					case <-ctx.Done():
+						manager.DecrementPendingRequest()
+						logger.Error(ctx, "Context canceled while waiting for available worker: %v", ctx.Err())
+						c.Writer.WriteHeader(http.StatusTooManyRequests)
+						c.Writer.Write([]byte(`{"error": "all workers have reached capacity limit"}`))
+						return
+					case <-time.After(5 * time.Millisecond):
+						continue
+					}
+				}
+				manager.DecrementPendingRequest()
+				logger.Error(ctx, "Failed to select worker: %v", err)
+				c.Writer.WriteHeader(http.StatusBadGateway)
+				c.Writer.Write([]byte(fmt.Sprintf(`{"error": "Failed to select worker: %v"}`, err)))
+				return
+			}
+			break
 		}
+		manager.DecrementPendingRequest()
 		destURL = dest
 		releaseTargets = []string{destURL}
 		requestBodyData = bodyBytes
@@ -478,9 +534,7 @@ func CommonCompletions(c *gin.Context, extractor PromptExtractor, completionEndp
 		}
 	}
 	//c.Writer.Header().Set("Transfer-Encoding", "chunked") // Set chunked transfer
-	if backendResp.StatusCode == http.StatusOK {
-		c.Writer.WriteHeader(backendResp.StatusCode)
-	}
+	c.Writer.WriteHeader(backendResp.StatusCode)
 
 	redirect(c, isStream, backendResp)
 }

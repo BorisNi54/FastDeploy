@@ -23,12 +23,17 @@ type ServerConfig struct {
 }
 
 type ManagerConfig struct {
-	RegisterPath            string  `yaml:"register-path"`
-	HealthFailureThreshold  int     `yaml:"health-failure-threshold"`
-	HealthSuccessThreshold  int     `yaml:"health-success-threshold"`
-	HealthCheckTimeoutSecs  float64 `yaml:"health-check-timeout-secs"`
-	HealthCheckIntervalSecs float64 `yaml:"health-check-interval-secs"`
-	HealthCheckEndpoint     string  `yaml:"health-check-endpoint"`
+	RegisterPath                string  `yaml:"register-path"`
+	HealthFailureThreshold      int     `yaml:"health-failure-threshold"`
+	HealthSuccessThreshold      int     `yaml:"health-success-threshold"`
+	HealthCheckTimeoutSecs      float64 `yaml:"health-check-timeout-secs"`
+	HealthCheckIntervalSecs     float64 `yaml:"health-check-interval-secs"`
+	HealthCheckEndpoint         string  `yaml:"health-check-endpoint"`
+	MetricsUpdateIntervalSecs   float64 `yaml:"metrics-update-interval-secs"`
+	QueueCheckIntervalSecs      float64 `yaml:"queue-check-interval-secs"`
+	QueueThreshold              int     `yaml:"queue-threshold"`
+	EnableInferReadyCheck       bool    `yaml:"enable-infer-ready-check"`
+	InferReadyCheckIntervalSecs float64 `yaml:"infer-ready-check-interval-secs"`
 }
 
 type SchedulerConfig struct {
@@ -95,6 +100,19 @@ func Load(configPath, listenPort string, isSplitwise bool) (*Config, error) {
 	}
 	if cfg.Manager.HealthSuccessThreshold == 0 {
 		cfg.Manager.HealthSuccessThreshold = 1
+	}
+	if cfg.Manager.MetricsUpdateIntervalSecs == 0 {
+		cfg.Manager.MetricsUpdateIntervalSecs = 1
+	}
+	if cfg.Manager.QueueCheckIntervalSecs == 0 {
+		cfg.Manager.QueueCheckIntervalSecs = 1
+	}
+	if cfg.Manager.QueueThreshold == 0 {
+		cfg.Manager.QueueThreshold = 10
+	}
+	// EnableInferReadyCheck defaults to false (bool zero value), no need to set
+	if cfg.Manager.InferReadyCheckIntervalSecs == 0 {
+		cfg.Manager.InferReadyCheckIntervalSecs = 1
 	}
 	if cfg.Scheduler.EvictionIntervalSecs == 0 {
 		cfg.Scheduler.EvictionIntervalSecs = 60

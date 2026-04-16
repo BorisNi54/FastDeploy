@@ -115,3 +115,115 @@ func TestSelectWorkerPair(t *testing.T) {
 	// which we don't want to mock in this unit test
 	t.Skip("Integration test requiring scheduler setup")
 }
+
+func TestPendingRequestCounter(t *testing.T) {
+	// Setup test data
+	Init(&config.Config{})
+
+	t.Run("initial count is zero", func(t *testing.T) {
+		count := GetPendingRequestCount()
+		assert.Equal(t, int64(0), count)
+	})
+
+	t.Run("increment increases count", func(t *testing.T) {
+		Init(&config.Config{}) // Reset
+		IncrementPendingRequest()
+		assert.Equal(t, int64(1), GetPendingRequestCount())
+
+		IncrementPendingRequest()
+		assert.Equal(t, int64(2), GetPendingRequestCount())
+	})
+
+	t.Run("decrement decreases count", func(t *testing.T) {
+		Init(&config.Config{}) // Reset
+		IncrementPendingRequest()
+		IncrementPendingRequest()
+		assert.Equal(t, int64(2), GetPendingRequestCount())
+
+		DecrementPendingRequest()
+		assert.Equal(t, int64(1), GetPendingRequestCount())
+
+		DecrementPendingRequest()
+		assert.Equal(t, int64(0), GetPendingRequestCount())
+	})
+
+	t.Run("decrement does not go below zero", func(t *testing.T) {
+		Init(&config.Config{}) // Reset
+		assert.Equal(t, int64(0), GetPendingRequestCount())
+
+		DecrementPendingRequest()
+		assert.Equal(t, int64(0), GetPendingRequestCount())
+
+		DecrementPendingRequest()
+		assert.Equal(t, int64(0), GetPendingRequestCount())
+	})
+
+	t.Run("handles nil DefaultManager", func(t *testing.T) {
+		oldManager := DefaultManager
+		DefaultManager = nil
+
+		// Should not panic
+		IncrementPendingRequest()
+		DecrementPendingRequest()
+		count := GetPendingRequestCount()
+		assert.Equal(t, int64(0), count)
+
+		DefaultManager = oldManager
+	})
+}
+
+func TestQueueingState(t *testing.T) {
+	// Setup test data
+	Init(&config.Config{})
+
+	t.Run("initial state is false", func(t *testing.T) {
+		assert.False(t, IsQueueing())
+	})
+
+	t.Run("set queueing state to true", func(t *testing.T) {
+		SetQueueingState(true)
+		assert.True(t, IsQueueing())
+	})
+
+	t.Run("set queueing state to false", func(t *testing.T) {
+		SetQueueingState(true)
+		assert.True(t, IsQueueing())
+
+		SetQueueingState(false)
+		assert.False(t, IsQueueing())
+	})
+
+	t.Run("handles nil DefaultManager", func(t *testing.T) {
+		oldManager := DefaultManager
+		DefaultManager = nil
+
+		// Should not panic
+		SetQueueingState(true)
+		isQueueing := IsQueueing()
+		assert.False(t, isQueueing)
+
+		DefaultManager = oldManager
+	})
+}
+
+func TestManagerInitNewFields(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Splitwise: false,
+		},
+		Manager: config.ManagerConfig{
+			HealthCheckTimeoutSecs: 5.0,
+			HealthCheckEndpoint:    "/health",
+			HealthFailureThreshold: 3,
+			HealthSuccessThreshold: 2,
+		},
+	}
+
+	Init(cfg)
+
+	assert.NotNil(t, DefaultManager)
+	assert.False(t, DefaultManager.inferReady)
+	assert.NotNil(t, DefaultManager.workerMetrics)
+	assert.False(t, DefaultManager.isQueueing)
+	assert.Equal(t, int64(0), DefaultManager.pendingRequestCount)
+}

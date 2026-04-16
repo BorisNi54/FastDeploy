@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,6 +14,12 @@ import (
 	"github.com/PaddlePaddle/FastDeploy/router/internal/config"
 	scheduler_common "github.com/PaddlePaddle/FastDeploy/router/internal/scheduler/common"
 	"github.com/PaddlePaddle/FastDeploy/router/pkg/logger"
+)
+
+// Error definitions for worker selection
+var (
+	ErrNoHealthyWorkers     = errors.New("no healthy workers available")
+	ErrAllWorkersAtCapacity = errors.New("all workers have reached capacity limit")
 )
 
 type Scheduler struct {
@@ -67,7 +74,7 @@ func Init(cfg *config.Config, managerAPI common.ManagerAPI) {
 // SelectWorker selects a worker based on the specified policy and worker type
 func SelectWorker(ctx context.Context, workers []string, message string, workerType string) (string, error) {
 	if len(workers) == 0 {
-		return "", fmt.Errorf("no healthy workers available")
+		return "", ErrNoHealthyWorkers
 	}
 
 	var policy string
@@ -101,6 +108,8 @@ func SelectWorker(ctx context.Context, workers []string, message string, workerT
 		strategyFunc = FDMetricsScoreSelectWorker
 	case "fd_remote_metrics_score":
 		strategyFunc = FDRemoteMetricsScoreSelectWorker
+	case "fd_remote_metrics_max_gpu_block":
+		strategyFunc = FDRemoteMetricsMaxGpuBlockSelectWorker
 	case "cache_aware":
 		strategyFunc = CacheAwarePrefillSelectWorker
 	case "remote_cache_aware":

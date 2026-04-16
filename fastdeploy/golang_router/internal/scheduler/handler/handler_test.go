@@ -26,9 +26,10 @@ func (m *mockManagerAPI) GetRemoteMetrics(ctx context.Context, url string) (int,
 func TestSchedulerInit(t *testing.T) {
 	cfg := &config.Config{
 		Scheduler: config.SchedulerConfig{
-			Policy:        "random",
-			PrefillPolicy: "process_tokens",
-			DecodePolicy:  "request_num",
+			Policy:               "random",
+			PrefillPolicy:        "process_tokens",
+			DecodePolicy:         "request_num",
+			EvictionDurationMins: 30, // Required to avoid panic in NewTicker
 		},
 	}
 
@@ -46,9 +47,10 @@ func TestSelectWorker(t *testing.T) {
 
 	Init(&config.Config{
 		Scheduler: config.SchedulerConfig{
-			Policy:        "random",
-			PrefillPolicy: "process_tokens",
-			DecodePolicy:  "request_num",
+			Policy:               "random",
+			PrefillPolicy:        "process_tokens",
+			DecodePolicy:         "request_num",
+			EvictionDurationMins: 30, // Required to avoid panic in NewTicker
 		},
 	}, &mockManagerAPI{})
 
@@ -88,7 +90,11 @@ func TestSelectWorker(t *testing.T) {
 
 func TestCounterOperations(t *testing.T) {
 	ctx := context.Background()
-	Init(&config.Config{}, nil)
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			EvictionDurationMins: 30, // Required to avoid panic in NewTicker
+		},
+	}, nil)
 
 	t.Run("counter increment", func(t *testing.T) {
 		counter := GetOrCreateCounter(ctx, "test")
@@ -124,7 +130,11 @@ func TestCounterOperations(t *testing.T) {
 
 func TestCleanupInvalidCounters(t *testing.T) {
 	ctx := context.Background()
-	Init(&config.Config{}, &mockManagerAPI{})
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			EvictionDurationMins: 30, // Required to avoid panic in NewTicker
+		},
+	}, &mockManagerAPI{})
 
 	t.Run("idle invalid counter deleted", func(t *testing.T) {
 		// Add some counters
@@ -152,7 +162,11 @@ func TestCleanupInvalidCounters(t *testing.T) {
 	})
 
 	t.Run("inflight invalid counter preserved", func(t *testing.T) {
-		Init(&config.Config{}, &mockManagerAPI{})
+		Init(&config.Config{
+			Scheduler: config.SchedulerConfig{
+				EvictionDurationMins: 30,
+			},
+		}, &mockManagerAPI{})
 
 		inflightCounter := GetOrCreateCounter(ctx, "inflight-invalid-worker")
 		inflightCounter.Inc() // simulate inflight request
@@ -190,7 +204,11 @@ func TestEstimateTokens(t *testing.T) {
 
 func TestReleasePrefillTokens(t *testing.T) {
 	ctx := context.Background()
-	Init(&config.Config{}, nil)
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			EvictionDurationMins: 30,
+		},
+	}, nil)
 
 	t.Run("valid release", func(t *testing.T) {
 		tc := GetOrCreateTokenCounter(ctx, "worker1")
@@ -210,7 +228,11 @@ func TestReleasePrefillTokens(t *testing.T) {
 
 func TestCleanupUnhealthyCounter(t *testing.T) {
 	ctx := context.Background()
-	Init(&config.Config{}, nil)
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			EvictionDurationMins: 30,
+		},
+	}, nil)
 
 	t.Run("counter preserved when inflight requests exist", func(t *testing.T) {
 		c := GetOrCreateCounter(ctx, "unhealthy-worker-inflight")
@@ -245,7 +267,11 @@ func TestCleanupUnhealthyCounter(t *testing.T) {
 
 func TestStartBackupCleanupTask(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	Init(&config.Config{}, &mockManagerAPI{})
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			EvictionDurationMins: 30,
+		},
+	}, &mockManagerAPI{})
 
 	// Add invalid counter
 	GetOrCreateCounter(ctx, "invalid-worker")
@@ -264,7 +290,11 @@ func TestStartBackupCleanupTask(t *testing.T) {
 
 func TestCounterLifecycle_UnhealthyAndReregister(t *testing.T) {
 	ctx := context.Background()
-	Init(&config.Config{}, &mockManagerAPI{})
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			EvictionDurationMins: 30,
+		},
+	}, &mockManagerAPI{})
 
 	url := "http://10.0.0.1:8080"
 
@@ -316,7 +346,11 @@ func TestCounterLifecycle_UnhealthyAndReregister(t *testing.T) {
 
 func TestCounterLifecycle_CleanupBeforeRelease(t *testing.T) {
 	ctx := context.Background()
-	Init(&config.Config{}, &mockManagerAPI{})
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			EvictionDurationMins: 30,
+		},
+	}, &mockManagerAPI{})
 
 	url := "http://10.0.0.2:8080"
 
@@ -347,7 +381,11 @@ func TestCounterLifecycle_CleanupBeforeRelease(t *testing.T) {
 	})
 
 	t.Run("cleanup deletes token counter then ReleasePrefillTokens is no-op", func(t *testing.T) {
-		Init(&config.Config{}, &mockManagerAPI{})
+		Init(&config.Config{
+			Scheduler: config.SchedulerConfig{
+				EvictionDurationMins: 30,
+			},
+		}, &mockManagerAPI{})
 		tokenURL := "http://10.0.0.3:8080"
 
 		tc := GetOrCreateTokenCounter(ctx, tokenURL)
@@ -366,5 +404,35 @@ func TestCounterLifecycle_CleanupBeforeRelease(t *testing.T) {
 		ReleasePrefillTokens(ctx, tokenURL, "hello world")
 		_, exists = GetTokenCounter(ctx, tokenURL)
 		assert.False(t, exists, "ReleasePrefillTokens should not create ghost token counter after cleanup")
+	})
+}
+
+func TestErrorDefinitions(t *testing.T) {
+	t.Run("ErrNoHealthyWorkers", func(t *testing.T) {
+		assert.NotNil(t, ErrNoHealthyWorkers)
+		assert.Equal(t, "no healthy workers available", ErrNoHealthyWorkers.Error())
+	})
+
+	t.Run("ErrAllWorkersAtCapacity", func(t *testing.T) {
+		assert.NotNil(t, ErrAllWorkersAtCapacity)
+		assert.Equal(t, "all workers have reached capacity limit", ErrAllWorkersAtCapacity.Error())
+	})
+}
+
+func TestSelectWorkerEmptyWorkers(t *testing.T) {
+	ctx := context.Background()
+	Init(&config.Config{
+		Scheduler: config.SchedulerConfig{
+			Policy:               "random",
+			PrefillPolicy:        "random",
+			DecodePolicy:         "random",
+			EvictionDurationMins: 30,
+		},
+	}, &mockManagerAPI{})
+
+	t.Run("returns ErrNoHealthyWorkers for empty workers", func(t *testing.T) {
+		_, err := SelectWorker(ctx, []string{}, "test message", "mixed")
+		assert.Error(t, err)
+		assert.Equal(t, ErrNoHealthyWorkers, err)
 	})
 }

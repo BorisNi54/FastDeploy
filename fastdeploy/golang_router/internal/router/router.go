@@ -29,7 +29,12 @@ func New(cfg *config.Config) *gin.Engine {
 	r.POST("/register", manager.RegisterInstance)
 	r.GET("/registered_number", manager.RegisteredNumber)
 	r.GET("/registered", manager.Registered)
+	r.GET("/health", manager.Health)
 	r.GET("/health_generate", manager.HealthGenerate)
+	r.GET("/worker_metrics", manager.WorkerMetricsHandler)
+	if cfg.Manager.EnableInferReadyCheck {
+		r.GET("/ready", manager.InferReady)
+	}
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	return r

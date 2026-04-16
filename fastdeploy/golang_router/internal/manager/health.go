@@ -1,7 +1,9 @@
 package manager
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"sync"
@@ -276,4 +278,294 @@ func MonitorInstanceHealth(ctx context.Context, intervalSecs float64) {
 			go MonitorInstanceHealthCore(ctx)
 		}
 	}
+}
+
+// CheckInferenceReady checks inference availability for all instances/PD pairs
+// In centralized mode: checks each mixed instance
+// In PD splitwise mode: checks all prefill-decode pairs
+// intervalSecs controls the wait time between check iterations
+func CheckInferenceReady(ctx context.Context, intervalSecs float64) {
+	if DefaultManager == nil {
+		logger.Error(ctx, "CheckInferenceReady: DefaultManager is nil")
+		return
+	}
+
+	isSplitwise := GetSplitwise(ctx)
+	logger.Info(ctx, "CheckInferenceReady started, splitwise=%v, interval=%.2fs", isSplitwise, intervalSecs)
+
+	// Track ready status across iterations
+	readyMixedInstances := make(map[string]bool)
+	readyPDPairs := make(map[pdPair]bool)
+
+	ticker := time.NewTicker(time.Duration(intervalSecs * float64(time.Second)))
+	defer ticker.Stop()
+
+	for {
+		var allReady bool
+		if isSplitwise {
+			allReady = checkPDPairsInference(ctx, readyPDPairs)
+		} else {
+			allReady = checkMixedInstancesInference(ctx, readyMixedInstances)
+		}
+
+		if allReady {
+			setInferReady(true)
+			logger.Info(ctx, "CheckInferenceReady: all instances/pairs ready, setting inferReady=true")
+			return
+		}
+
+		// Wait for next check interval or context cancellation
+		select {
+		case <-ctx.Done():
+			logger.Info(ctx, "CheckInferenceReady: context cancelled")
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// checkMixedInstancesInference checks inference for all mixed instances
+func checkMixedInstancesInference(ctx context.Context, readyInstances map[string]bool) bool {
+	mixedInstances := WorkerMapToList(ctx, "mixed")
+	if len(mixedInstances) == 0 {
+		logger.Debug(ctx, "checkMixedInstancesInference: no mixed instances available")
+		return false
+	}
+
+	for _, url := range mixedInstances {
+		if readyInstances[url] {
+			continue
+		}
+		if checkSingleInstanceInference(ctx, url) {
+			readyInstances[url] = true
+			logger.Info(ctx, "checkMixedInstancesInference: instance %s is ready", url)
+		} else {
+			logger.Debug(ctx, "checkMixedInstancesInference: instance %s not ready yet", url)
+		}
+	}
+
+	// Check if all instances are ready
+	for _, url := range mixedInstances {
+		if !readyInstances[url] {
+			return false
+		}
+	}
+	return len(mixedInstances) > 0
+}
+
+// pdPair represents a prefill-decode instance pair
+type pdPair struct {
+	prefill string
+	decode  string
+}
+
+// checkPDPairsInference checks inference for all PD pairs
+func checkPDPairsInference(ctx context.Context, readyPairs map[pdPair]bool) bool {
+	prefillInstances := WorkerMapToList(ctx, "prefill")
+	decodeInstances := WorkerMapToList(ctx, "decode")
+
+	if len(prefillInstances) == 0 || len(decodeInstances) == 0 {
+		logger.Debug(ctx, "checkPDPairsInference: no prefill or decode instances available")
+		return false
+	}
+
+	// Check all PD combinations
+	for _, prefillURL := range prefillInstances {
+		for _, decodeURL := range decodeInstances {
+			pair := pdPair{prefill: prefillURL, decode: decodeURL}
+			if readyPairs[pair] {
+				continue
+			}
+			if checkPDPairInference(ctx, prefillURL, decodeURL) {
+				readyPairs[pair] = true
+				logger.Info(ctx, "checkPDPairsInference: PD pair (%s, %s) is ready", prefillURL, decodeURL)
+			} else {
+				logger.Debug(ctx, "checkPDPairsInference: PD pair (%s, %s) not ready yet", prefillURL, decodeURL)
+			}
+		}
+	}
+
+	// Check if all pairs are ready
+	totalPairs := len(prefillInstances) * len(decodeInstances)
+	return len(readyPairs) == totalPairs && totalPairs > 0
+}
+
+// checkSingleInstanceInference sends a simple inference request to a single instance
+func checkSingleInstanceInference(ctx context.Context, instanceURL string) bool {
+	return sendInferenceRequest(ctx, instanceURL)
+}
+
+// checkPDPairInference sends inference request to a PD pair
+func checkPDPairInference(ctx context.Context, prefillURL, decodeURL string) bool {
+	// Build disaggregate_info for PD pair
+	disagg, err := BuildDisaggregateInfo(ctx, prefillURL, decodeURL)
+	if err != nil {
+		logger.Error(ctx, "checkPDPairInference: failed to build disaggregate_info: %v", err)
+		return false
+	}
+
+	return sendPDInferenceRequest(ctx, prefillURL, decodeURL, disagg)
+}
+
+// sendInferenceRequest sends a simple inference request to check if the instance can complete inference
+func sendInferenceRequest(ctx context.Context, instanceURL string) bool {
+	reqBody := map[string]any{
+		"model": "default",
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+		"max_tokens": 1,
+		"stream":     false,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		logger.Error(ctx, "sendInferenceRequest: failed to marshal request: %v", err)
+		return false
+	}
+
+	endpoint := instanceURL + "/v1/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		logger.Error(ctx, "sendInferenceRequest: failed to create request: %v", err)
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Error(ctx, "sendInferenceRequest: request to %s failed: %v", instanceURL, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	// Read and discard response body
+	_, _ = io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusOK {
+		return true
+	}
+	logger.Debug(ctx, "sendInferenceRequest: instance %s returned status %d", instanceURL, resp.StatusCode)
+	return false
+}
+
+// sendPDInferenceRequest sends inference request to PD pair
+func sendPDInferenceRequest(ctx context.Context, prefillURL, decodeURL string, disagg map[string]any) bool {
+	reqBody := map[string]any{
+		"model": "default",
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+		"max_tokens":        1,
+		"stream":            false,
+		"disaggregate_info": disagg,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		logger.Error(ctx, "sendPDInferenceRequest: failed to marshal request: %v", err)
+		return false
+	}
+
+	// Send requests to both prefill and decode concurrently
+	type respResult struct {
+		url     string
+		success bool
+		err     error
+	}
+
+	prefillCh := make(chan respResult, 1)
+	decodeCh := make(chan respResult, 1)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	// Send to prefill
+	go func() {
+		endpoint := prefillURL + "/v1/chat/completions"
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			prefillCh <- respResult{url: prefillURL, success: false, err: err}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			prefillCh <- respResult{url: prefillURL, success: false, err: err}
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		prefillCh <- respResult{url: prefillURL, success: resp.StatusCode == http.StatusOK, err: nil}
+	}()
+
+	// Send to decode
+	go func() {
+		endpoint := decodeURL + "/v1/chat/completions"
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			decodeCh <- respResult{url: decodeURL, success: false, err: err}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			decodeCh <- respResult{url: decodeURL, success: false, err: err}
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		decodeCh <- respResult{url: decodeURL, success: resp.StatusCode == http.StatusOK, err: nil}
+	}()
+
+	prefillRes := <-prefillCh
+	decodeRes := <-decodeCh
+
+	if prefillRes.err != nil {
+		logger.Error(ctx, "sendPDInferenceRequest: prefill request to %s failed: %v", prefillURL, prefillRes.err)
+	}
+	if decodeRes.err != nil {
+		logger.Error(ctx, "sendPDInferenceRequest: decode request to %s failed: %v", decodeURL, decodeRes.err)
+	}
+
+	// Both must succeed for the PD pair to be considered ready
+	return prefillRes.success && decodeRes.success
+}
+
+// setInferReady sets the inferReady status
+func setInferReady(ready bool) {
+	if DefaultManager == nil {
+		return
+	}
+	DefaultManager.mu.Lock()
+	defer DefaultManager.mu.Unlock()
+	DefaultManager.inferReady = ready
+}
+
+// GetInferReady returns the current inferReady status
+func GetInferReady(ctx context.Context) bool {
+	if DefaultManager == nil {
+		return false
+	}
+	DefaultManager.mu.RLock()
+	defer DefaultManager.mu.RUnlock()
+	return DefaultManager.inferReady
+}
+
+// InferReady is the HTTP handler for /ready endpoint
+func InferReady(c *gin.Context) {
+	ready := GetInferReady(c.Request.Context())
+	c.JSON(http.StatusOK, gin.H{
+		"code":        200,
+		"infer_ready": ready,
+	})
+}
+
+// Health is the HTTP handler for /health endpoint
+// Used for external service availability probing
+func Health(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"code":   200,
+		"status": "ok",
+	})
 }

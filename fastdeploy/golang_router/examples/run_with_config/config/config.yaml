@@ -1,13 +1,13 @@
 server:
-  port: "8080"
+  port: "8091"
   host: "0.0.0.0"
   mode: "debug" # debug, release, test
   splitwise: true # true means pd mode, false means mixed mode
 
 scheduler:
-  policy: "power_of_two"
+  policy: "fd_remote_metrics_max_gpu_block"
   prefill-policy: "cache_aware"
-  decode-policy: "request_num"
+  decode-policy: "fd_remote_metrics_max_gpu_block"
   eviction-interval-secs: 60
   eviction-duration-mins: 30 # eviction duration for cache-aware radix tree nodes (minutes); default: 30
   balance-abs-threshold: 1
